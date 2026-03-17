@@ -37,7 +37,7 @@ USER_COOLDOWN_SEC  = 60     # minimum seconds between join requests per user
 MAX_REQUESTS_PER_HOUR = 5   # max join triggers per user per hour
 BAN_THRESHOLD      = 15     # auto-ignore after this many requests/hour (abuse)
 HEART_EFFECT_ID    = "5159385139981059251"
-BASE_VIDEO_COUNT   = 16568
+BASE_VIDEO_COUNT   = 30000
 
 # ─── IN-MEMORY STATE ─────────────────────────────────────────
 # uid -> {"messages":[], "video_count":int, "last_join":float,
@@ -135,7 +135,7 @@ def make_buttons():
             "\U0001f4e4  SHARE FOR MORE", url=share_url()
         )],
         [InlineKeyboardButton(
-            "\U0001f4b3  PAY FOR ACCESS \u2014 \u20b1499", url=PAYMENT_LINK
+            "\U0001f4b3  PAY FOR ACCESS \u2014 \u20b1205", url=PAYMENT_LINK
         )],
     ])
 
@@ -191,9 +191,7 @@ async def send_content(bot, chat_id, state):
                 chat_id=chat_id,
                 video=vid_id,
                 protect_content=True,        # blocks forward / save / screenshot
-                has_spoiler=True,             # spoiler blur — forces tap to reveal
                 supports_streaming=True,
-                disable_notification=True,    # silent send
             )
             video_msgs.append(msg.message_id)
             logger.info("%s sent -> %s", label, chat_id)
