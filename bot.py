@@ -63,7 +63,7 @@ def share_url():
 def make_buttons():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("\U0001f4e4  SHARE NOW \u2014 IT'S FREE", url=share_url())],
-        [InlineKeyboardButton("\u26a1  INSTANT ACCESS \u2014 \u20b1205 ONLY", url=PAYMENT_LINK)],
+        [InlineKeyboardButton("\u26a1  INSTANT ACCESS", url=PAYMENT_LINK)],
     ])
 
 # ── Auto-delete scheduler ───────────────────────────────────
