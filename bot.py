@@ -125,7 +125,6 @@ async def send_content(bot, chat_id, state):
         "*" + vid_count + " exclusive videos* for FREE!\n\n"
         "\u2705 Verification is *instant & automatic*\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\u26a1 *Or get FULL ACCESS now for only \u20b1205!*"
     )
     info = await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=make_buttons())
     all_msgs.append(info.message_id)
