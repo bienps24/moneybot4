@@ -1,73 +1,138 @@
 import asyncio
+import json
 import logging
 import os
-import random
+from pathlib import Path
 from urllib.parse import quote
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ChatJoinRequestHandler, MessageHandler, filters, ContextTypes
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    ChatJoinRequestHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN    = os.environ["BOT_TOKEN"]
-ADMIN_ID     = int(os.environ.get("ADMIN_ID", "0"))
-CHANNEL_ID   = int(os.environ["CHANNEL_ID"])
-CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "")
-PAYMENT_LINK = os.environ.get("PAYMENT_LINK", "")
-VIDEO_1_ID   = os.environ.get("VIDEO_1_ID", "")
-VIDEO_2_ID   = os.environ.get("VIDEO_2_ID", "")
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+CHANNEL_ID = int(os.environ["CHANNEL_ID"])
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "").strip()
+PAYMENT_LINK = os.environ.get("PAYMENT_LINK", "").strip()
 
-VIDEO_DELETE_DELAY = 10       # 10 seconds for videos
-CHAT_DELETE_DELAY  = 180      # 3 minutes for all other messages
-HEART_EFFECT_ID    = "5159385139981059251"
-BASE_VIDEO_COUNT   = 16568
+# Optional defaults from env
+ENV_VIDEO_1_ID = os.environ.get("VIDEO_1_ID", "").strip()
+ENV_VIDEO_2_ID = os.environ.get("VIDEO_2_ID", "").strip()
 
-# Per-user state
-channel_users = {}
+# File where saved IDs live
+# Use /data/video_ids.json if you have a persistent volume mounted at /data
+VIDEO_STORE_PATH = Path(os.environ.get("VIDEO_STORE_PATH", "video_ids.json"))
+
+VIDEO_DELETE_DELAY = int(os.environ.get("VIDEO_DELETE_DELAY", "20"))
+TEXT_DELETE_DELAY = int(os.environ.get("TEXT_DELETE_DELAY", "300"))
+
 channel_name_cache = ""
 
-# ── Security: block list ─────────────────────────────────────
-blocked_users = set()
 
-def is_blocked(uid):
-    return uid in blocked_users
+def clean(value: str) -> str:
+    return (value or "").strip()
 
-# ── Channel name cache ───────────────────────────────────────
+
+def mask_file_id(file_id: str) -> str:
+    file_id = clean(file_id)
+    if not file_id:
+        return "(empty)"
+    if len(file_id) <= 40:
+        return file_id
+    return f"{file_id[:22]}...{file_id[-12:]}"
+
+
+def load_video_ids() -> dict:
+    data = {
+        "VIDEO_1_ID": clean(ENV_VIDEO_1_ID),
+        "VIDEO_2_ID": clean(ENV_VIDEO_2_ID),
+    }
+
+    if VIDEO_STORE_PATH.exists():
+        try:
+            raw = json.loads(VIDEO_STORE_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data["VIDEO_1_ID"] = clean(raw.get("VIDEO_1_ID", data["VIDEO_1_ID"]))
+                data["VIDEO_2_ID"] = clean(raw.get("VIDEO_2_ID", data["VIDEO_2_ID"]))
+                logger.info("Loaded saved video IDs from %s", VIDEO_STORE_PATH)
+        except Exception as e:
+            logger.warning("Could not load %s: %s", VIDEO_STORE_PATH, e)
+
+    return data
+
+
+def save_video_ids(data: dict) -> None:
+    payload = {
+        "VIDEO_1_ID": clean(data.get("VIDEO_1_ID", "")),
+        "VIDEO_2_ID": clean(data.get("VIDEO_2_ID", "")),
+    }
+    VIDEO_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    VIDEO_STORE_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("Saved video IDs to %s", VIDEO_STORE_PATH)
+
+
+VIDEO_IDS = load_video_ids()
+
+
+def get_video_pairs():
+    return [
+        ("VIDEO_1_ID", clean(VIDEO_IDS.get("VIDEO_1_ID", ""))),
+        ("VIDEO_2_ID", clean(VIDEO_IDS.get("VIDEO_2_ID", ""))),
+    ]
+
+
 async def get_channel_name(bot):
     global channel_name_cache
     if channel_name_cache:
         return channel_name_cache
+
     try:
         chat = await bot.get_chat(CHANNEL_ID)
-        channel_name_cache = chat.title or "OUR"
+        channel_name_cache = chat.title or "OUR CHANNEL"
     except Exception:
-        channel_name_cache = "OUR"
+        channel_name_cache = "OUR CHANNEL"
+
     return channel_name_cache
 
-# ── User state management ────────────────────────────────────
-def get_user(uid):
-    return channel_users.get(uid)
 
-def upsert_user(uid):
-    if uid not in channel_users:
-        channel_users[uid] = {"messages": [], "video_count": BASE_VIDEO_COUNT}
-    else:
-        channel_users[uid]["video_count"] += random.randint(50, 200)
-        channel_users[uid]["messages"] = []
-    return channel_users[uid]
+def share_url() -> str:
+    if not CHANNEL_LINK:
+        return "https://t.me"
+    return (
+        "https://t.me/share/url?url="
+        + quote(CHANNEL_LINK)
+        + "&text="
+        + quote("Join this channel")
+    )
 
-# ── URL & button helpers ─────────────────────────────────────
-def share_url():
-    return "https://t.me/share/url?url=" + quote(CHANNEL_LINK) + "&text=" + quote("Check this out! \U0001f525 Join now!")
 
 def make_buttons():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001f4e4  SHARE NOW \u2014 IT'S FREE", url=share_url())],
-        [InlineKeyboardButton("\u26a1  INSTANT ACCESS", url=PAYMENT_LINK)],
-    ])
+    rows = [
+        [InlineKeyboardButton("SHARE 3 TIMES TO ACCESS", url=share_url())]
+    ]
 
-# ── Auto-delete scheduler ───────────────────────────────────
-async def schedule_delete(bot, chat_id, message_ids, delay):
+    if PAYMENT_LINK:
+        rows.append([InlineKeyboardButton("INSTANT ACCESS", url=PAYMENT_LINK)])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def schedule_delete(bot, chat_id: int, message_ids: list[int], delay: int):
     await asyncio.sleep(delay)
     for mid in message_ids:
         try:
@@ -75,177 +140,236 @@ async def schedule_delete(bot, chat_id, message_ids, delay):
         except Exception:
             pass
 
-# ── Main content sender ─────────────────────────────────────
-async def send_content(bot, chat_id, state):
+
+async def send_content(bot, chat_id: int):
     channel_name = await get_channel_name(bot)
-    vid_count = f"{state['video_count']:,}"
 
-    all_msgs = []
+    sent_video_message_ids = []
 
-    # Heart with effect
-    try:
-        heart_msg = await bot.send_message(
-            chat_id=chat_id,
-            text="\u2764\ufe0f",
-            message_effect_id=HEART_EFFECT_ID,
-        )
-        all_msgs.append(heart_msg.message_id)
-    except Exception as e:
-        logger.warning("Heart effect error: " + str(e))
-
-    # Videos (protected content + spoiler)
-    video_msgs = []
-    for label, vid_id in [
-        ("VIDEO_1_ID", VIDEO_1_ID),
-        ("VIDEO_2_ID", VIDEO_2_ID),
-    ]:
+    for label, vid_id in get_video_pairs():
         if not vid_id:
-            logger.warning(label + " is empty!")
+            logger.warning("%s is empty", label)
             continue
+
         try:
             msg = await bot.send_video(
                 chat_id=chat_id,
                 video=vid_id,
-                protect_content=True,
                 supports_streaming=True,
-                has_spoiler=True,
+                protect_content=True,
             )
-            video_msgs.append(msg.message_id)
-            logger.info(label + " sent to " + str(chat_id))
+            sent_video_message_ids.append(msg.message_id)
+            logger.info("%s sent to %s", label, chat_id)
         except Exception as e:
-            logger.error(label + " error: " + str(e))
+            logger.error("%s failed: %s", label, e)
 
-    # Promo text
     text = (
-        "\U0001f512 *" + channel_name.upper() + " \u2014 EXCLUSIVE PRIVATE CHANNEL*\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
-        "\U0001f381 *SHARE = FREE ACCESS*\n\n"
-        "\U0001f4ca *0 / 2 SHARES COMPLETED*\n\n"
-        "\U0001f4e2 Share this channel to *2 groups* to unlock\n"
-        "*" + vid_count + " exclusive videos* for FREE!\n\n"
-        "\u2705 Verification is *instant & automatic*\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"⚠️ *{channel_name.upper()} — CHANNEL IS PRIVATE*\n"
+        f"──────────────────\n\n"
+        f"📤 *Tap the button below to share*\n\n"
+        f"📊 *0 / 3 SHARES COMPLETED*\n\n"
+        f"Use the button below if you want quicker access.\n\n"
+        f"──────────────────"
     )
-    info = await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=make_buttons())
-    all_msgs.append(info.message_id)
 
-    # Videos = 10 sec delete
-    if video_msgs:
-        asyncio.create_task(schedule_delete(bot, chat_id, video_msgs, VIDEO_DELETE_DELAY))
-    # Heart + promo = 3 min delete
-    if all_msgs:
-        asyncio.create_task(schedule_delete(bot, chat_id, all_msgs, CHAT_DELETE_DELAY))
+    info = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=make_buttons(),
+    )
 
-# ── Handlers ─────────────────────────────────────────────────
+    if sent_video_message_ids:
+        asyncio.create_task(
+            schedule_delete(bot, chat_id, sent_video_message_ids, VIDEO_DELETE_DELAY)
+        )
+
+    asyncio.create_task(
+        schedule_delete(bot, chat_id, [info.message_id], TEXT_DELETE_DELAY)
+    )
+
+
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     join_req = update.chat_join_request
-    user = join_req.from_user
+    if not join_req:
+        return
+
     if join_req.chat.id != CHANNEL_ID:
         return
-    if is_blocked(user.id):
-        return
-    logger.info("Join request: " + str(user.id) + " (" + str(user.full_name) + ")")
-    state = upsert_user(user.id)
-    await send_content(context.bot, user.id, state)
 
-async def auto_reply_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    uid = update.effective_user.id
-    if uid == ADMIN_ID:
-        return
-    if is_blocked(uid):
-        return
-    state = get_user(uid)
-    if state is None:
-        return
-    state["video_count"] += random.randint(10, 50)
-    msg = await update.message.reply_text("SHARE!")
+    user = join_req.from_user
+    logger.info("Join request from %s (%s)", user.id, user.full_name)
 
-    messages_to_delete = [update.message.message_id, msg.message_id]
-    asyncio.create_task(schedule_delete(context.bot, update.effective_chat.id, messages_to_delete, CHAT_DELETE_DELAY))
+    try:
+        await send_content(context.bot, user.id)
+    except Exception as e:
+        logger.error("Failed to send content to %s: %s", user.id, e)
 
-# ── Admin commands ───────────────────────────────────────────
-async def get_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    if update.message and update.message.video:
-        fid = update.message.video.file_id
-        await update.message.reply_text(
-            "\u2705 *file_id for this bot:*\n\n`" + fid + "`",
-            parse_mode="Markdown"
-        )
+
+    await update.message.reply_text(
+        "Admin commands:\n"
+        "/showvideos\n"
+        "/testvideo\n"
+        "/clearvideo1\n"
+        "/clearvideo2\n"
+        "/setvideo1  (reply to a video)\n"
+        "/setvideo2  (reply to a video)\n\n"
+        "You can also send a video with caption:\n"
+        "/setvideo1\n"
+        "or\n"
+        "/setvideo2"
+    )
+
+
+async def show_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    msg = (
+        "Current saved video IDs\n\n"
+        f"VIDEO_1_ID:\n`{clean(VIDEO_IDS.get('VIDEO_1_ID', '')) or '(empty)'}`\n\n"
+        f"VIDEO_2_ID:\n`{clean(VIDEO_IDS.get('VIDEO_2_ID', '')) or '(empty)'}`\n\n"
+        f"Store path:\n`{VIDEO_STORE_PATH}`"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def clear_video1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    VIDEO_IDS["VIDEO_1_ID"] = ""
+    save_video_ids(VIDEO_IDS)
+    await update.message.reply_text("VIDEO_1_ID cleared.")
+
+
+async def clear_video2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    VIDEO_IDS["VIDEO_2_ID"] = ""
+    save_video_ids(VIDEO_IDS)
+    await update.message.reply_text("VIDEO_2_ID cleared.")
+
 
 async def test_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text("Testing videos...")
-    for label, vid_id in [("VIDEO_1_ID", VIDEO_1_ID), ("VIDEO_2_ID", VIDEO_2_ID)]:
+
+    await update.message.reply_text("Testing saved videos...")
+
+    for label, vid_id in get_video_pairs():
         if not vid_id:
-            await update.message.reply_text(label + " EMPTY!")
+            await update.message.reply_text(f"{label} EMPTY")
             continue
+
         try:
-            await context.bot.send_video(chat_id=update.effective_chat.id, video=vid_id, protect_content=True, supports_streaming=True)
-            await update.message.reply_text(label + " OK!")
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=vid_id,
+                supports_streaming=True,
+                protect_content=True,
+            )
+            await update.message.reply_text(f"{label} OK")
         except Exception as e:
-            await update.message.reply_text(label + " FAILED: " + str(e))
+            await update.message.reply_text(f"{label} FAILED: {e}")
 
-async def block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def set_video1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    if not context.args:
-        await update.message.reply_text("Usage: /block <user_id>")
-        return
-    try:
-        target = int(context.args[0])
-        blocked_users.add(target)
-        channel_users.pop(target, None)
-        await update.message.reply_text("\u2705 Blocked user " + str(target))
-    except ValueError:
-        await update.message.reply_text("\u274c Invalid user ID")
 
-async def unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.message or not update.message.reply_to_message or not update.message.reply_to_message.video:
+        await update.message.reply_text("Reply to a video with /setvideo1")
         return
-    if not context.args:
-        await update.message.reply_text("Usage: /unblock <user_id>")
-        return
-    try:
-        target = int(context.args[0])
-        blocked_users.discard(target)
-        await update.message.reply_text("\u2705 Unblocked user " + str(target))
-    except ValueError:
-        await update.message.reply_text("\u274c Invalid user ID")
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    text = (
-        "\U0001f4ca *Bot Stats*\n\n"
-        "Users tracked: *" + str(len(channel_users)) + "*\n"
-        "Blocked users: *" + str(len(blocked_users)) + "*\n"
-        "Video delete: *" + str(VIDEO_DELETE_DELAY) + "s*\n"
-        "Chat delete: *" + str(CHAT_DELETE_DELAY) + "s*"
+    fid = clean(update.message.reply_to_message.video.file_id)
+    VIDEO_IDS["VIDEO_1_ID"] = fid
+    save_video_ids(VIDEO_IDS)
+
+    await update.message.reply_text(
+        f"VIDEO_1_ID saved.\n\n`{fid}`",
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
-# ── Main ─────────────────────────────────────────────────────
+
+async def set_video2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not update.message or not update.message.reply_to_message or not update.message.reply_to_message.video:
+        await update.message.reply_text("Reply to a video with /setvideo2")
+        return
+
+    fid = clean(update.message.reply_to_message.video.file_id)
+    VIDEO_IDS["VIDEO_2_ID"] = fid
+    save_video_ids(VIDEO_IDS)
+
+    await update.message.reply_text(
+        f"VIDEO_2_ID saved.\n\n`{fid}`",
+        parse_mode="Markdown",
+    )
+
+
+async def admin_video_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not update.message or not update.message.video:
+        return
+
+    fid = clean(update.message.video.file_id)
+    caption = clean(update.message.caption).lower()
+
+    if caption == "/setvideo1":
+        VIDEO_IDS["VIDEO_1_ID"] = fid
+        save_video_ids(VIDEO_IDS)
+        await update.message.reply_text(
+            f"VIDEO_1_ID saved.\n\n`{fid}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if caption == "/setvideo2":
+        VIDEO_IDS["VIDEO_2_ID"] = fid
+        save_video_ids(VIDEO_IDS)
+        await update.message.reply_text(
+            f"VIDEO_2_ID saved.\n\n`{fid}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text(
+        "Video received.\n\n"
+        f"`{fid}`\n\n"
+        "To save it automatically, send the video with caption:\n"
+        "/setvideo1\n"
+        "or\n"
+        "/setvideo2",
+        parse_mode="Markdown",
+    )
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Admin commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("showvideos", show_videos))
     app.add_handler(CommandHandler("testvideo", test_video))
-    app.add_handler(CommandHandler("block", block_user))
-    app.add_handler(CommandHandler("unblock", unblock_user))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(MessageHandler(filters.VIDEO & filters.User(ADMIN_ID), get_file_id))
+    app.add_handler(CommandHandler("clearvideo1", clear_video1))
+    app.add_handler(CommandHandler("clearvideo2", clear_video2))
+    app.add_handler(CommandHandler("setvideo1", set_video1))
+    app.add_handler(CommandHandler("setvideo2", set_video2))
 
-    # User handlers
-    app.add_handler(ChatJoinRequestHandler(handle_join_request))
-    app.add_handler(MessageHandler(filters.ALL, auto_reply_share))
+    app.add_handler(MessageHandler(filters.VIDEO & filters.User(ADMIN_ID), admin_video_receiver))
+    app.add_handler(ChatJoinRequestHandler(handle_join_request, chat_id=CHANNEL_ID))
 
-    logger.info("Bot running.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot running...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
